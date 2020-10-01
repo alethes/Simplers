@@ -4,7 +4,8 @@ use crate::search_space::*;
 use priority_queue::PriorityQueue;
 use ordered_float::OrderedFloat;
 use num_traits::Float;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, RwLock};
+use rayon::prelude::*;
 
 /// Stores the parameters and current state of a search.
 ///
@@ -14,12 +15,13 @@ pub struct Optimizer<'f_lifetime, CoordFloat: Float, ValueFloat: Float>
 {
    exploration_depth: ValueFloat,
    search_space: SearchSpace<'f_lifetime, CoordFloat, ValueFloat>,
-   best_point: Rc<Point<CoordFloat, ValueFloat>>,
-   min_value: ValueFloat,
-   queue: PriorityQueue<Simplex<CoordFloat, ValueFloat>, OrderedFloat<ValueFloat>>
+   best_point: RwLock<Arc<Point<CoordFloat, ValueFloat>>>,
+   min_value: RwLock<ValueFloat>,
+   queue: Arc<Mutex<PriorityQueue<Simplex<CoordFloat, ValueFloat>, OrderedFloat<ValueFloat>>>>
 }
 
-impl<'f_lifetime, CoordFloat: Float, ValueFloat: Float> Optimizer<'f_lifetime, CoordFloat, ValueFloat>
+impl<'f_lifetime, CoordFloat: Float + Send + Sync, ValueFloat: Float + Send + Sync>
+   Optimizer<'f_lifetime, CoordFloat, ValueFloat>
 {
    /// Creates a new optimizer to explore the given search space with the iterator interface.
    ///
@@ -46,7 +48,7 @@ impl<'f_lifetime, CoordFloat: Float, ValueFloat: Float> Optimizer<'f_lifetime, C
    /// println!("min value: {} found in [{}, {}]", min_value, coordinates[0], coordinates[1]);
    /// # }
    /// ```
-   pub fn new(f: &'f_lifetime impl Fn(&[CoordFloat]) -> ValueFloat,
+   pub fn new(f: &'f_lifetime (impl Fn(&[CoordFloat]) -> ValueFloat + Send + Sync),
               input_interval: &[(CoordFloat, CoordFloat)],
               should_minimize: bool)
               -> Self
@@ -74,7 +76,11 @@ impl<'f_lifetime, CoordFloat: Float, ValueFloat: Float> Optimizer<'f_lifetime, C
       queue.push(initial_simplex, OrderedFloat(ValueFloat::zero()));
 
       let exploration_depth = ValueFloat::from(6.).unwrap();
-      Optimizer { exploration_depth, search_space, best_point, min_value, queue }
+      Optimizer { exploration_depth,
+                  search_space,
+                  best_point: RwLock::new(best_point),
+                  min_value: RwLock::new(min_value),
+                  queue: Arc::new(Mutex::new(queue)) }
    }
 
    /// Sets the exploration depth for the algorithm, useful when using the iterator interface.
@@ -133,7 +139,7 @@ impl<'f_lifetime, CoordFloat: Float, ValueFloat: Float> Optimizer<'f_lifetime, C
    /// println!("max value: {} found in [{}, {}]", max_value, coordinates[0], coordinates[1]);
    /// # }
    /// ```
-   pub fn maximize(f: &'f_lifetime impl Fn(&[CoordFloat]) -> ValueFloat,
+   pub fn maximize(f: &'f_lifetime (impl Fn(&[CoordFloat]) -> ValueFloat + Send + Sync),
                    input_interval: &[(CoordFloat, CoordFloat)],
                    nb_iterations: usize)
                    -> (ValueFloat, Coordinates<CoordFloat>)
@@ -160,7 +166,7 @@ impl<'f_lifetime, CoordFloat: Float, ValueFloat: Float> Optimizer<'f_lifetime, C
    /// println!("min value: {} found in [{}, {}]", min_value, coordinates[0], coordinates[1]);
    /// # }
    /// ```
-   pub fn minimize(f: &'f_lifetime impl Fn(&[CoordFloat]) -> ValueFloat,
+   pub fn minimize(f: &'f_lifetime (impl Fn(&[CoordFloat]) -> ValueFloat + Send + Sync),
                    input_interval: &[(CoordFloat, CoordFloat)],
                    nb_iterations: usize)
                    -> (ValueFloat, Coordinates<CoordFloat>)
@@ -174,7 +180,7 @@ impl<'f_lifetime, CoordFloat: Float, ValueFloat: Float> Optimizer<'f_lifetime, C
 }
 
 /// implements iterator for the Optimizer to give full control on the stopping condition to the user
-impl<'f_lifetime, CoordFloat: Float, ValueFloat: Float> Iterator
+impl<'f_lifetime, CoordFloat: Float + Send + Sync, ValueFloat: Float + Send + Sync> Iterator
    for Optimizer<'f_lifetime, CoordFloat, ValueFloat>
 {
    type Item = (ValueFloat, Coordinates<CoordFloat>);
@@ -184,47 +190,74 @@ impl<'f_lifetime, CoordFloat: Float, ValueFloat: Float> Iterator
    {
       // gets the exploration depth for later use
       let exploration_depth = self.exploration_depth;
+      let current_difference = { self.best_point.read().unwrap().value - *self.min_value.read().unwrap() };
+      let simplexes: Vec<_> = (0..num_cpus::get()).map(|_| {
+                                 let mut queue = self.queue.lock().unwrap();
+                                 // gets an up to date simplex
+                                 let simplex = match queue.pop()
+                                 {
+                                    Some(simplex) =>
+                                    {
+                                       let mut simplex = simplex.0;
+                                       while simplex.difference != current_difference
+                                       {
+                                          // updates the simplex and pushes it back into the queue
+                                          simplex.difference = current_difference;
+                                          let new_evaluation = simplex.evaluate(exploration_depth);
+                                          queue.push(simplex, OrderedFloat(new_evaluation));
+                                          // pops a new simplex
+                                          simplex =
+                                             queue.pop().expect("Impossible: The queue cannot be empty!").0;
+                                       }
+                                       simplex
+                                    }
+                                    None => return None
+                                 };
+                                 Some(std::sync::Arc::new(simplex))
+                              })
+                              .filter_map(|s| s)
+                              .collect();
+      simplexes.into_par_iter()
+               .map(|simplex| {
+                  // evaluate the center of the simplex
+                  let coordinates = simplex.center.clone();
+                  let value = self.search_space.evaluate(&coordinates);
+                  let new_point = Arc::new(Point { coordinates, value });
 
-      // gets an up to date simplex
-      let mut simplex = self.queue.pop().expect("Impossible: The queue cannot be empty!").0;
-      let current_difference = self.best_point.value - self.min_value;
-      while simplex.difference != current_difference
-      {
-         // updates the simplex and pushes it back into the queue
-         simplex.difference = current_difference;
-         let new_evaluation = simplex.evaluate(exploration_depth);
-         self.queue.push(simplex, OrderedFloat(new_evaluation));
-         // pops a new simplex
-         simplex = self.queue.pop().expect("Impossible: The queue cannot be empty!").0;
-      }
+                  // splits the simplex around its center and push the subsimplex into the queue
+                  match Arc::try_unwrap(simplex)
+                  {
+                     Ok(simplex) => simplex.split(new_point.clone(), current_difference)
+                                           .into_iter()
+                                           .map(|s| (OrderedFloat(s.evaluate(exploration_depth)), s))
+                                           .for_each(|(e, s)| {
+                                              self.queue.lock().unwrap().push(s, e);
+                                           }),
+                     Err(_) => panic!("More than one reference to a split simplex")
+                  }
 
-      // evaluate the center of the simplex
-      let coordinates = simplex.center.clone();
-      let value = self.search_space.evaluate(&coordinates);
-      let new_point = Rc::new(Point { coordinates, value });
-
-      // splits the simplex around its center and push the subsimplex into the queue
-      simplex.split(new_point.clone(), current_difference)
-             .into_iter()
-             .map(|s| (OrderedFloat(s.evaluate(exploration_depth)), s))
-             .for_each(|(e, s)| {
-                self.queue.push(s, e);
-             });
-
-      // updates the difference
-      if value > self.best_point.value
-      {
-         self.best_point = new_point;
-      }
-      else if value < self.min_value
-      {
-         self.min_value = value;
-      }
-
+                  // updates the difference
+                  if value > self.best_point.read().unwrap().value
+                  {
+                     *self.best_point.write().unwrap() = new_point;
+                  }
+                  else if value < *self.min_value.read().unwrap()
+                  {
+                     *self.min_value.write().unwrap() = value;
+                  }
+               })
+               .collect::<Vec<()>>();
       // gets the best value so far
-      let best_value =
-         if self.search_space.minimize { -self.best_point.value } else { self.best_point.value };
-      let best_coordinate = self.search_space.to_hypercube(self.best_point.coordinates.clone());
+      let best_value = if self.search_space.minimize
+      {
+         -self.best_point.read().unwrap().value
+      }
+      else
+      {
+         self.best_point.read().unwrap().value
+      };
+      let best_coordinate =
+         self.search_space.to_hypercube(self.best_point.read().unwrap().coordinates.clone());
       Some((best_value, best_coordinate))
    }
 }

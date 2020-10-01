@@ -5,7 +5,7 @@ use num_traits::Float;
 /// encapsulate a function and its domain of definition
 pub struct SearchSpace<'f_lifetime, CoordFloat: Float, ValueFloat: Float>
 {
-   f: &'f_lifetime dyn Fn(&[CoordFloat]) -> ValueFloat,
+   f: &'f_lifetime (dyn Fn(&[CoordFloat]) -> ValueFloat + Send + Sync),
    hypercube: Vec<(CoordFloat, CoordFloat)>,
    pub minimize: bool,
    pub dimension: usize
@@ -14,7 +14,7 @@ pub struct SearchSpace<'f_lifetime, CoordFloat: Float, ValueFloat: Float>
 impl<'f_lifetime, CoordFloat: Float, ValueFloat: Float> SearchSpace<'f_lifetime, CoordFloat, ValueFloat>
 {
    /// builds a new search space that encapsulate both the function to evaluate and its domain of definition
-   pub fn new(f: &'f_lifetime impl Fn(&[CoordFloat]) -> ValueFloat,
+   pub fn new(f: &'f_lifetime (impl Fn(&[CoordFloat]) -> ValueFloat + Send + Sync),
               hypercube: &[(CoordFloat, CoordFloat)],
               minimize: bool)
               -> Self

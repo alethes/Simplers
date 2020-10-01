@@ -1,7 +1,7 @@
 use crate::point::*;
 use crate::search_space::*;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::sync::Arc;
 use num_traits::Float;
 
 /// represents a simplex
@@ -9,7 +9,7 @@ use num_traits::Float;
 pub struct Simplex<CoordFloat: Float, ValueFloat: Float>
 {
    /// the coordinate+evaluations of the corners of the simplex
-   pub corners: Vec<Rc<Point<CoordFloat, ValueFloat>>>,
+   pub corners: Vec<Arc<Point<CoordFloat, ValueFloat>>>,
    /// the coordinates of the center of the simplex (which is where it is evaluated)
    pub center: Coordinates<CoordFloat>,
    /// what was the difference between the best value and the worst value when the simplex was last evaluated ?
@@ -21,7 +21,8 @@ pub struct Simplex<CoordFloat: Float, ValueFloat: Float>
 impl<CoordFloat: Float, ValueFloat: Float> Simplex<CoordFloat, ValueFloat>
 {
    /// creates a new simplex
-   fn new(corners: Vec<Rc<Point<CoordFloat, ValueFloat>>>, ratio: ValueFloat, difference: ValueFloat) -> Self
+   fn new(corners: Vec<Arc<Point<CoordFloat, ValueFloat>>>, ratio: ValueFloat, difference: ValueFloat)
+          -> Self
    {
       let center = Point::average_coordinate(&corners);
       Simplex { corners, center, ratio, difference }
@@ -35,17 +36,16 @@ impl<CoordFloat: Float, ValueFloat: Float> Simplex<CoordFloat, ValueFloat>
 
       // builds one corner per dimension
       let mut corners: Vec<_> = (0..search_space.dimension).map(|i| {
-                                                                      let mut coordinates = origin.clone();
-                                                                      coordinates[i] = CoordFloat::one();
-                                                                      let value =
-                                                                         search_space.evaluate(&coordinates);
-                                                                      Rc::new(Point { coordinates, value })
-                                                                   })
-                                                                   .collect();
+                                                              let mut coordinates = origin.clone();
+                                                              coordinates[i] = CoordFloat::one();
+                                                              let value = search_space.evaluate(&coordinates);
+                                                              Arc::new(Point { coordinates, value })
+                                                           })
+                                                           .collect();
 
       // adds the corner corresponding to the origin
       let min_corner = Point { value: search_space.evaluate(&origin), coordinates: origin };
-      corners.push(Rc::new(min_corner));
+      corners.push(Arc::new(min_corner));
 
       // assemble the simplex
       Simplex::new(corners, ValueFloat::one(), ValueFloat::zero())
@@ -53,15 +53,16 @@ impl<CoordFloat: Float, ValueFloat: Float> Simplex<CoordFloat, ValueFloat>
 
    /// takes a simplex and splits it around a point
    /// difference is the best value so far minus the worst value so far
-   pub fn split(self, new_point: Rc<Point<CoordFloat, ValueFloat>>, difference: ValueFloat) -> Vec<Self>
+   pub fn split(self, new_point: Arc<Point<CoordFloat, ValueFloat>>, difference: ValueFloat) -> Vec<Self>
    {
       // computes the distance between the new point and each corners of the simplex
       let distances: Box<[ValueFloat]> = self.corners
-                                      .iter()
-                                      .map(|c| &c.coordinates)
-                                      .map(|c| Point::distance(c, &new_point.coordinates))
-                                      .collect();
-      let total_distance: ValueFloat = distances.iter().map(|&c| c).fold(ValueFloat::zero(), ::std::ops::Add::add);
+                                             .iter()
+                                             .map(|c| &c.coordinates)
+                                             .map(|c| Point::distance(c, &new_point.coordinates))
+                                             .collect();
+      let total_distance: ValueFloat =
+         distances.iter().map(|&c| c).fold(ValueFloat::zero(), ::std::ops::Add::add);
 
       // computes each sub simplex
       let mut result = vec![];
@@ -92,13 +93,20 @@ impl<CoordFloat: Float, ValueFloat: Float> Simplex<CoordFloat, ValueFloat>
    {
       // computes the inverse of the distance from the center to each corner
       let inverse_distances: Vec<ValueFloat> =
-         self.corners.iter().map(|c| ValueFloat::one() / Point::distance(&c.coordinates, &self.center)).collect();
-      let total_inverse_distance: ValueFloat = inverse_distances.iter().map(|&d| d).fold(ValueFloat::zero(), ::std::ops::Add::add);
+         self.corners
+             .iter()
+             .map(|c| ValueFloat::one() / Point::distance(&c.coordinates, &self.center))
+             .collect();
+      let total_inverse_distance: ValueFloat =
+         inverse_distances.iter().map(|&d| d).fold(ValueFloat::zero(), ::std::ops::Add::add);
 
       // computes the value of the center, interpolated from the corners
-      let interpolated_value =
-         self.corners.iter().zip(inverse_distances.iter()).map(|(c, &d)| c.value * d).fold(ValueFloat::zero(), ::std::ops::Add::add)
-         / total_inverse_distance;
+      let interpolated_value = self.corners
+                                   .iter()
+                                   .zip(inverse_distances.iter())
+                                   .map(|(c, &d)| c.value * d)
+                                   .fold(ValueFloat::zero(), ::std::ops::Add::add)
+                               / total_inverse_distance;
 
       // computes the number of split needed to reach the given ratio if we start from a regular simplex
       let dim = ValueFloat::from(self.center.len()).unwrap();
