@@ -17,7 +17,8 @@ pub struct Optimizer<'f_lifetime, CoordFloat: Float, ValueFloat: Float>
    search_space: SearchSpace<'f_lifetime, CoordFloat, ValueFloat>,
    best_point: RwLock<Arc<Point<CoordFloat, ValueFloat>>>,
    min_value: RwLock<ValueFloat>,
-   queue: Arc<Mutex<PriorityQueue<Simplex<CoordFloat, ValueFloat>, OrderedFloat<ValueFloat>>>>
+   queue: Arc<Mutex<PriorityQueue<Simplex<CoordFloat, ValueFloat>, OrderedFloat<ValueFloat>>>>,
+   threads: usize
 }
 
 impl<'f_lifetime, CoordFloat: Float + Send + Sync, ValueFloat: Float + Send + Sync>
@@ -50,7 +51,8 @@ impl<'f_lifetime, CoordFloat: Float + Send + Sync, ValueFloat: Float + Send + Sy
    /// ```
    pub fn new(f: &'f_lifetime (impl Fn(&[CoordFloat]) -> ValueFloat + Send + Sync),
               input_interval: &[(CoordFloat, CoordFloat)],
-              should_minimize: bool)
+              should_minimize: bool,
+              threads: usize)
               -> Self
    {
       // builds initial conditions
@@ -80,7 +82,8 @@ impl<'f_lifetime, CoordFloat: Float + Send + Sync, ValueFloat: Float + Send + Sy
                   search_space,
                   best_point: RwLock::new(best_point),
                   min_value: RwLock::new(min_value),
-                  queue: Arc::new(Mutex::new(queue)) }
+                  queue: Arc::new(Mutex::new(queue)),
+                  threads }
    }
 
    /// Sets the exploration depth for the algorithm, useful when using the iterator interface.
@@ -141,14 +144,16 @@ impl<'f_lifetime, CoordFloat: Float + Send + Sync, ValueFloat: Float + Send + Sy
    /// ```
    pub fn maximize(f: &'f_lifetime (impl Fn(&[CoordFloat]) -> ValueFloat + Send + Sync),
                    input_interval: &[(CoordFloat, CoordFloat)],
-                   nb_iterations: usize)
+                   nb_iterations: usize,
+                   threads: usize)
                    -> (ValueFloat, Coordinates<CoordFloat>)
    {
       let initial_iteration_number = input_interval.len() + 1;
       let should_minimize = false;
-      Optimizer::new(f, input_interval, should_minimize).skip(nb_iterations - initial_iteration_number)
-                                                        .next()
-                                                        .unwrap()
+      Optimizer::new(f, input_interval, should_minimize, threads).skip(nb_iterations
+                                                                       - initial_iteration_number)
+                                                                 .next()
+                                                                 .unwrap()
    }
 
    /// Self contained optimization algorithm.
@@ -168,14 +173,16 @@ impl<'f_lifetime, CoordFloat: Float + Send + Sync, ValueFloat: Float + Send + Sy
    /// ```
    pub fn minimize(f: &'f_lifetime (impl Fn(&[CoordFloat]) -> ValueFloat + Send + Sync),
                    input_interval: &[(CoordFloat, CoordFloat)],
-                   nb_iterations: usize)
+                   nb_iterations: usize,
+                   threads: usize)
                    -> (ValueFloat, Coordinates<CoordFloat>)
    {
       let initial_iteration_number = input_interval.len() + 1;
       let should_minimize = true;
-      Optimizer::new(f, input_interval, should_minimize).skip(nb_iterations - initial_iteration_number)
-                                                        .next()
-                                                        .unwrap()
+      Optimizer::new(f, input_interval, should_minimize, threads).skip(nb_iterations
+                                                                       - initial_iteration_number)
+                                                                 .next()
+                                                                 .unwrap()
    }
 }
 
@@ -191,32 +198,33 @@ impl<'f_lifetime, CoordFloat: Float + Send + Sync, ValueFloat: Float + Send + Sy
       // gets the exploration depth for later use
       let exploration_depth = self.exploration_depth;
       let current_difference = { self.best_point.read().unwrap().value - *self.min_value.read().unwrap() };
-      let simplexes: Vec<_> = (0..num_cpus::get()).map(|_| {
-                                 let mut queue = self.queue.lock().unwrap();
-                                 // gets an up to date simplex
-                                 let simplex = match queue.pop()
-                                 {
-                                    Some(simplex) =>
-                                    {
-                                       let mut simplex = simplex.0;
-                                       while simplex.difference != current_difference
-                                       {
-                                          // updates the simplex and pushes it back into the queue
-                                          simplex.difference = current_difference;
-                                          let new_evaluation = simplex.evaluate(exploration_depth);
-                                          queue.push(simplex, OrderedFloat(new_evaluation));
-                                          // pops a new simplex
-                                          simplex =
-                                             queue.pop().expect("Impossible: The queue cannot be empty!").0;
-                                       }
-                                       simplex
-                                    }
-                                    None => return None
-                                 };
-                                 Some(std::sync::Arc::new(simplex))
-                              })
-                              .filter_map(|s| s)
-                              .collect();
+      let simplexes: Vec<_> = (0..self.threads).map(|_| {
+                                                  let mut queue = self.queue.lock().unwrap();
+                                                  // gets an up to date simplex
+                                                  let simplex = match queue.pop()
+                                                  {
+                                                     Some(simplex) =>
+                                                     {
+                                                        let mut simplex = simplex.0;
+                                                        while simplex.difference != current_difference
+                                                        {
+                                                           // updates the simplex and pushes it back into the queue
+                                                           simplex.difference = current_difference;
+                                                           let new_evaluation =
+                                                              simplex.evaluate(exploration_depth);
+                                                           queue.push(simplex, OrderedFloat(new_evaluation));
+                                                           // pops a new simplex
+                                                           simplex =
+                                            queue.pop().expect("Impossible: The queue cannot be empty!").0;
+                                                        }
+                                                        simplex
+                                                     }
+                                                     None => return None
+                                                  };
+                                                  Some(std::sync::Arc::new(simplex))
+                                               })
+                                               .filter_map(|s| s)
+                                               .collect();
       simplexes.into_par_iter()
                .map(|simplex| {
                   // evaluate the center of the simplex
